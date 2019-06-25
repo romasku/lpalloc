@@ -5,6 +5,7 @@
 int brk(void *addr);
 void *sbrk(intptr_t increment);
 
+
 #include <memory.h>
 // !SYSTEM
 
@@ -14,7 +15,7 @@ void free(void *ptr);
 // Config constants
 #define BINS_NUM		128
 #define EXACT_BINS		64
-#define CHUNK_ALIGN		8		// Should be power of two
+#define CHUNK_ALIGN		16		// Should be power of two
 #define PAGE_SIZE		4096	// Should be power of two
 #define USED_CHUNK_BIT  1
 
@@ -164,57 +165,6 @@ void remove_chunk_from_bin(int bin, free_header_t *chunk) {
     }
 }
 
-void *malloc(size_t size) {
-    check_init();
-	size = request_size_to_allocated(size);
-	int bin = to_bin_number(size);
-	free_header_t *chunk = NULL;
-	/*
-	 * Here we trying to find chunk in bin. We go through bins and store smallest one.
-	 * This done by next using using next rules:
-	 * - chunks in bin are sorted from bigger to smaller, so we have to take last that is big enough.
-	 * - all chunks in one bin are smaller then chunks in next bin, so if we found chunk, we should not
-	 * check other bins.
-	 */
-	while (chunk == NULL && bin < BINS_NUM) {
-		free_header_t *bin_chunk = bins[bin].first;
-		while (bin_chunk != NULL && bin_chunk->size < size) {
-		    chunk = bin_chunk;
-		    bin_chunk = bin_chunk->next;
-		}
-		if (chunk == NULL) {
-		    // Go to next bin if we did not find chunk
-            bin++;
-        }
-	}
-    if (chunk != NULL) {
-        // If we found chunk, we have to remove it from bin.
-        remove_chunk_from_bin(bin, chunk);
-        // Also we update length of allocated memory region
-        size = chunk->size;
-	}
-	if (chunk == NULL) {
-        /*
-         * If chunk wasn't found, we have to work with memory end border. First we check,
-         * do we have enough space in end gap. If it is not enough, we get more from OS Memory
-         * manager. Then we prepare chunk and move end gap.
-         */
-        size_t end_gap_size = memory_end - end_gap_begin;
-		if (end_gap_size < size) {
-			size_t sbrk_size = align_page_top(size - end_gap_size);
-			sbrk(sbrk_size);
-            memory_end += sbrk_size;
-		}
-		chunk = end_gap_begin;
-		end_gap_begin += size;
-	}
-    used_header_t *allocated = (used_header_t *) chunk;
-    footer_t *allocated_footer = (footer_t *) ((void *)chunk + size - sizeof(used_header_t));
-	*allocated = size | USED_CHUNK_BIT;
-	*allocated_footer = size | USED_CHUNK_BIT;
-	return ((void *)allocated) + sizeof(used_header_t);
-}
-
 void add_new_chunk_to_bin(void* start, size_t size) {
     free_header_t *new_chunk = start;
     footer_t *footer = start + size - sizeof(footer_t);
@@ -241,8 +191,75 @@ void add_new_chunk_to_bin(void* start, size_t size) {
             next_chunk->prev = new_chunk;
         }
         new_chunk->prev = prev_chunk;
-        new_chunk->next = new_chunk;
+        new_chunk->next = next_chunk;
     }
+}
+
+#define return_threshold 10 * 1024 * 1024
+
+void return_memory_if_needed() {
+    size_t end_gap_size = (size_t)(memory_end - end_gap_begin);
+    if (end_gap_size > return_threshold) {
+        size_t space_to_free = end_gap_size - return_threshold;
+        sbrk(-space_to_free);
+        memory_end -= space_to_free;
+    }
+}
+
+void *malloc(size_t size) {
+    check_init();
+	size = request_size_to_allocated(size);
+	int bin = to_bin_number(size);
+	free_header_t *chunk = NULL;
+	/*
+	 * Here we trying to find chunk in bin. We go through bins and store smallest one.
+	 * This done by next using using next rules:
+	 * - chunks in bin are sorted from bigger to smaller, so we have to take last that is big enough.
+	 * - all chunks in one bin are smaller then chunks in next bin, so if we found chunk, we should not
+	 * check other bins.
+	 */
+	while (chunk == NULL && bin < BINS_NUM) {
+		free_header_t *bin_chunk = bins[bin].first;
+		while (bin_chunk != NULL && bin_chunk->size >=size) {
+		    chunk = bin_chunk;
+		    bin_chunk = bin_chunk->next;
+		}
+		if (chunk == NULL) {
+		    // Go to next bin if we did not find chunk
+            bin++;
+        }
+	}
+    if (chunk != NULL) {
+        // If we found chunk, we have to remove it from bin.
+        remove_chunk_from_bin(bin, chunk);
+        // If chunk is to large, we have to split it
+        if (chunk->size - size > MIN_SIZE) {
+            add_new_chunk_to_bin((void *)chunk + size, chunk->size - size);
+            chunk->size = size;
+        }
+        // Also we update length of allocated memory region
+        size = chunk->size;
+	}
+	if (chunk == NULL) {
+        /*
+         * If chunk wasn't found, we have to work with memory end border. First we check,
+         * do we have enough space in end gap. If it is not enough, we get more from OS Memory
+         * manager. Then we prepare chunk and move end gap.
+         */
+        size_t end_gap_size = memory_end - end_gap_begin;
+		if (end_gap_size < size) {
+			size_t sbrk_size = align_page_top(size - end_gap_size);
+			void * end = sbrk(sbrk_size);
+            memory_end += sbrk_size;
+		}
+		chunk = end_gap_begin;
+		end_gap_begin += size;
+	}
+    used_header_t *allocated = (used_header_t *) chunk;
+    footer_t *allocated_footer = (footer_t *) ((void *)chunk + size - sizeof(used_header_t));
+	*allocated = size | USED_CHUNK_BIT;
+	*allocated_footer = size | USED_CHUNK_BIT;
+	return ((void *)allocated) + sizeof(used_header_t);
 }
 
 void free(void *ptr) {
@@ -270,7 +287,13 @@ void free(void *ptr) {
         size += next_chunk_size;
         next_chunk = (void *)next_chunk + next_chunk_size;
     }
-    add_new_chunk_to_bin((void *)prev_chunk_end + sizeof(footer_t), size);
+    // Check, did we get to the end_gap_begin
+    if (next_chunk == end_gap_begin) {
+        end_gap_begin -= size;
+        return_memory_if_needed();
+    } else {
+        add_new_chunk_to_bin((void *) prev_chunk_end + sizeof(footer_t), size);
+    }
 }
 
 void *calloc(size_t nmemb, size_t size) {
