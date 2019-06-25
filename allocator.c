@@ -4,6 +4,8 @@
 // SYSTEM 
 int brk(void *addr);
 void *sbrk(intptr_t increment);
+
+#include <memory.h>
 // !SYSTEM
 
 void *malloc(size_t size);
@@ -14,6 +16,7 @@ void free(void *ptr);
 #define EXACT_BINS		64
 #define CHUNK_ALIGN		8		// Should be power of two
 #define PAGE_SIZE		4096	// Should be power of two
+#define USED_CHUNK_BIT  1
 
 // Align macros
 /*
@@ -149,52 +152,146 @@ int to_bin_number(size_t size) {
 	return bin;
 }
 
+void remove_chunk_from_bin(int bin, free_header_t *chunk) {
+    if (chunk->next != NULL) {
+        chunk->next->prev = chunk->prev;
+    }
+    if (chunk->prev != NULL) {
+        chunk->prev->next = chunk->next;
+    } else {
+        // It was first chunk in bin, we have to change bins first chunk
+        bins[bin].first = chunk->next;
+    }
+}
+
 void *malloc(size_t size) {
+    check_init();
 	size = request_size_to_allocated(size);
 	int bin = to_bin_number(size);
-	// Now we will try to find free chunk of required size
 	free_header_t *chunk = NULL;
 	/*
-	 * Here we simply go through all bins with size not less then required size
-	 * and if then in there first chunk with size not less then required. Either
-     * we will find one, or chunk will be still NULL.
+	 * Here we trying to find chunk in bin. We go through bins and store smallest one.
+	 * This done by next using using next rules:
+	 * - chunks in bin are sorted from bigger to smaller, so we have to take last that is big enough.
+	 * - all chunks in one bin are smaller then chunks in next bin, so if we found chunk, we should not
+	 * check other bins.
 	 */
 	while (chunk == NULL && bin < BINS_NUM) {
-		free_header_t *chunk = bins[bin].first;
-		while (chunk != NULL && chunk->size < size) chunk = chunk->next;
+		free_header_t *bin_chunk = bins[bin].first;
+		while (bin_chunk != NULL && bin_chunk->size < size) {
+		    chunk = bin_chunk;
+		    bin_chunk = bin_chunk->next;
+		}
+		if (chunk == NULL) {
+		    // Go to next bin if we did not find chunk
+            bin++;
+        }
 	}
-	/*
-	 * If we had find chunk, it is time to remove it from his bin. As next code 
-	 * will not be sure, was this chunk received from bin or it is newly created 
-	 * using sbrk call.
-	 */
     if (chunk != NULL) {
-		if (chunk->next != NULL) {
-			chunk->next->previous = chunk->previous;
-		}
-		if (chunk->previous != NULL) {
-			chunk->previous->next = chunk->next;
-		} else {
-			// If here, than it is first chunk in bin
-			bins[bin]->first = chunk->next;
-		}
+        // If we found chunk, we have to remove it from bin.
+        remove_chunk_from_bin(bin, chunk);
+        // Also we update length of allocated memory region
+        size = chunk->size;
 	}
-	/*
-	 * If chunk wasn't found, we have to work with end part of memory. First we
-	 * is there enough space in end gap. We it isn't, we get more from OS Memory
-	 * manager. Then we prepare chunk and move end gap.
-	 */
 	if (chunk == NULL) {
-		if (end_of_memory - end_gap_begin < size) {
-			size_t sbrk_size = aligned_page_top(size - (end_of_memory - end_gap_begin));
+        /*
+         * If chunk wasn't found, we have to work with memory end border. First we check,
+         * do we have enough space in end gap. If it is not enough, we get more from OS Memory
+         * manager. Then we prepare chunk and move end gap.
+         */
+        size_t end_gap_size = memory_end - end_gap_begin;
+		if (end_gap_size < size) {
+			size_t sbrk_size = align_page_top(size - end_gap_size);
 			sbrk(sbrk_size);
-			end_of_memory += sbrk_size;
+            memory_end += sbrk_size;
 		}
 		chunk = end_gap_begin;
 		end_gap_begin += size;
 	}
+    used_header_t *allocated = (used_header_t *) chunk;
+    footer_t *allocated_footer = (footer_t *) ((void *)chunk + size - sizeof(used_header_t));
+	*allocated = size | USED_CHUNK_BIT;
+	*allocated_footer = size | USED_CHUNK_BIT;
+	return ((void *)allocated) + sizeof(used_header_t);
 }
 
+void add_new_chunk_to_bin(void* start, size_t size) {
+    free_header_t *new_chunk = start;
+    footer_t *footer = start + size - sizeof(footer_t);
+    new_chunk->size = size;
+    *footer = size;
+    int bin = to_bin_number(size);
+    if (bins[bin].first == NULL) {
+        bins[bin].first = new_chunk;
+        new_chunk->prev = NULL;
+        new_chunk->next = NULL;
+    } else {
+        free_header_t *prev_chunk = NULL;
+        free_header_t *next_chunk = bins[bin].first;
+        while (next_chunk != NULL && size < new_chunk->size) {
+            prev_chunk = next_chunk;
+            next_chunk = next_chunk->next;
+        }
+        if (prev_chunk == NULL) {
+            bins[bin].first = new_chunk;
+        } else {
+            prev_chunk->next = new_chunk;
+        }
+        if (next_chunk != NULL) {
+            next_chunk->prev = new_chunk;
+        }
+        new_chunk->prev = prev_chunk;
+        new_chunk->next = new_chunk;
+    }
+}
+
+void free(void *ptr) {
+    check_init();
+    if (ptr == NULL) {
+        return;
+    }
+    // First, we get size of memory area we are freeing
+    used_header_t *header = ptr - sizeof(used_header_t);
+    size_t size = *header & (~USED_CHUNK_BIT);
+    // While previous memory area contains free chunk, we remove thoses chunk from bin and
+    // grab all memory to return it all as free chunk.
+    footer_t *prev_chunk_end = ((void *)header) - sizeof(footer_t);
+    free_header_t *next_chunk = ((void *)header) + size;
+    while (memory_begin < (void *)prev_chunk_end && (*prev_chunk_end & USED_CHUNK_BIT) == 0) {
+        size_t prev_chunk_size = *prev_chunk_end;
+        free_header_t *prev_chunk = (void *)prev_chunk_end - prev_chunk_size + sizeof(footer_t);
+        remove_chunk_from_bin(to_bin_number(prev_chunk_size), prev_chunk);
+        size += prev_chunk_size;
+        prev_chunk_end = (void *)prev_chunk - sizeof(footer_t);
+    }
+    while ((void *)next_chunk < end_gap_begin && (next_chunk->size & USED_CHUNK_BIT) == 0) {
+        size_t next_chunk_size = next_chunk->size;
+        remove_chunk_from_bin(to_bin_number(next_chunk_size), next_chunk);
+        size += next_chunk_size;
+        next_chunk = (void *)next_chunk + next_chunk_size;
+    }
+    add_new_chunk_to_bin((void *)prev_chunk_end + sizeof(footer_t), size);
+}
+
+void *calloc(size_t nmemb, size_t size) {
+    return malloc(nmemb * size);
+}
+
+void *realloc(void *ptr, size_t size) {
+    size_t old_size = *(used_header_t *)(ptr - sizeof(used_header_t));
+    void *new_addr = malloc(size);
+    size_t copy_size = size;
+    if (old_size < copy_size) {
+        copy_size = old_size;
+    }
+    memcpy(new_addr, ptr, copy_size);
+    free(ptr);
+    return new_addr;
+}
+
+void *reallocarray(void *ptr, size_t nmemb, size_t size) {
+    return realloc(ptr, nmemb * size);
+}
 
 
 

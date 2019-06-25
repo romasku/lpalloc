@@ -1,8 +1,8 @@
-#include <stdlib.h>
+#include "../allocator.h"
 #include <stdio.h>
 
 int main() {
-	char *arr = malloc(10000);
+	int *arr = malloc(10000 * sizeof(int));
 	for (int i = 0; i < 10000; i++) {
 		arr[i] = i;
 	}
@@ -12,6 +12,6 @@ int main() {
 			return 1;
 		}
 	}
-	free(arr);
+	//free(arr);
 	return 0;
 }
